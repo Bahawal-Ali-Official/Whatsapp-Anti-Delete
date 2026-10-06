@@ -1,0 +1,24 @@
+{
+  "name": "whatsapp-deleted-message-recovery",
+  "version": "2.0.0",
+  "description": "WhatsApp deleted message recovery bot optimized for low memory VMs",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node --max-old-space-size=512 index.js"
+  },
+  "keywords": [
+    "whatsapp",
+    "bot",
+    "baileys",
+    "deleted-messages"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^6.7.2",
+    "pino": "^8.1.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
