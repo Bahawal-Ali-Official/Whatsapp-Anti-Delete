@@ -282,13 +282,15 @@ async function processMessage(sock, msg) {
 
     const type = getContentType(msg.message);
 
-    const proto = msg.message.protocolMessage;
-    if (proto?.editedMessage) {
-        const origId = proto.key.id;
-        const origMsg = messageStore.get(origId);
-        const newText = proto.editedMessage.conversation || extractTextContent(proto.editedMessage);
-        
-        if (newText) {
+    if (type === 'editedMessage') {
+        const editProto = msg.message.editedMessage?.message?.protocolMessage;
+        if (!editProto) return;
+
+        const origId = editProto.key?.id;
+        const newText = editProto.editedMessage?.conversation || editProto.editedMessage?.extendedTextMessage?.text;
+
+        if (origId && newText) {
+            const origMsg = messageStore.get(origId);
             const origText = extractTextContent(origMsg?.message);
             await handleEdited(sock, msg, origText, newText);
             messageStore.updateText(origId, newText);
