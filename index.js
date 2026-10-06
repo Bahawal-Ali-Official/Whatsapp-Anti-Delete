@@ -4,12 +4,22 @@ import {
     useMultiFileAuthState,
     DisconnectReason,
     downloadMediaMessage,
-    getContentType
+    getContentType,
+    makeCacheableSignalKeyStore
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import qrTerminal from 'qrcode-terminal';
 
 const logger = pino({ level: 'silent' });
+
+const msgRetryCounterCache = new Map();
+
+const originalConsoleError = console.error;
+console.error = (...args) => {
+    const msg = args[0]?.toString() || '';
+    if (msg.includes('Failed to decrypt') || msg.includes('Bad MAC') || msg.includes('session_cipher')) return;
+    originalConsoleError.apply(console, args);
+};
 
 const MAX_STORE_SIZE = 5000;
 const MESSAGE_TTL_MS = 2 * 60 * 60 * 1000;
@@ -308,8 +318,12 @@ async function startBot() {
 
     const sock = makeWASocket({
         logger,
-        auth: state,
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, logger)
+        },
         printQRInTerminal: false,
+        msgRetryCounterCache,
         shouldIgnoreJid: jid => typeof jid === 'string' && jid.includes('@broadcast'),
         getMessage: async (key) => {
             const stored = messageStore.get(key.id);
