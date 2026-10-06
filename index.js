@@ -5,7 +5,10 @@ import {
     DisconnectReason,
     downloadMediaMessage,
     getContentType,
-    makeCacheableSignalKeyStore
+    makeCacheableSignalKeyStore,
+    proto as WAProto,
+    aesDecryptGCM,
+    hmacSign
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import qrTerminal from 'qrcode-terminal';
@@ -13,6 +16,8 @@ import qrTerminal from 'qrcode-terminal';
 const logger = pino({ level: 'silent' });
 
 const msgRetryCounterCache = new Map();
+
+const SECRET_ENC_TYPE = WAProto.Message.SecretEncryptedMessage.SecretEncType;
 
 const originalConsoleError = console.error;
 console.error = (...args) => {
@@ -126,6 +131,22 @@ async function getGroupName(sock, jid) {
     } catch (e) {
         return "Unknown Group";
     }
+}
+
+function decryptSecretMessage(encPayload, encIv, secret, targetId, senderJid) {
+    const toBuf = (txt) => Buffer.from(txt);
+    const senderBuf = toBuf(senderJid);
+    const sign = Buffer.concat([
+        toBuf(targetId),
+        senderBuf,
+        senderBuf,
+        toBuf('Message Edit'),
+        new Uint8Array([1])
+    ]);
+    const key = hmacSign(secret, new Uint8Array(32));
+    const decKey = hmacSign(sign, key);
+    const decrypted = aesDecryptGCM(encPayload, decKey, encIv, Buffer.alloc(0));
+    return WAProto.Message.decode(decrypted);
 }
 
 async function processSingleDeletedMessage(sock, deletedMsg) {
@@ -267,7 +288,38 @@ async function handleViewOnce(sock, message, type) {
     }
 }
 
-async function handleEditedMessage(sock, message) {
+async function handleSecretEncryptedEdit(sock, message) {
+    const secEnc = message.message?.secretEncryptedMessage;
+    if (!secEnc || secEnc.secretEncType !== SECRET_ENC_TYPE.MESSAGE_EDIT) return false;
+
+    try {
+        const targetId = secEnc.targetMessageKey?.id;
+        if (!targetId) return false;
+
+        const originalMsg = messageStore.get(targetId);
+        if (!originalMsg) return false;
+
+        const msgSecret = originalMsg.message?.messageContextInfo?.messageSecret;
+        if (!msgSecret) return false;
+
+        const senderJid = message.key.participant || message.key.remoteJid;
+        const decryptedMsg = decryptSecretMessage(secEnc.encPayload, secEnc.encIv, msgSecret, targetId, senderJid);
+        const newText = extractTextContent(decryptedMsg);
+        if (!newText) return false;
+
+        const originalContent = extractTextContent(originalMsg.message);
+        await processSingleEditedMessage(sock, message, originalContent, newText);
+
+        originalMsg.message.conversation = newText;
+        messageStore.set(targetId, originalMsg);
+        return true;
+    } catch (e) {
+        console.error(`Error decrypting edited message: ${e.message}`);
+        return false;
+    }
+}
+
+async function handleLegacyEdit(sock, message) {
     const proto = message.message?.protocolMessage;
     if (!proto?.editedMessage) return false;
 
@@ -296,8 +348,13 @@ async function processMessage(sock, message) {
 
     const type = getContentType(message.message);
 
+    if (type === 'secretEncryptedMessage') {
+        await handleSecretEncryptedEdit(sock, message);
+        return;
+    }
+
     if (type === 'protocolMessage') {
-        await handleEditedMessage(sock, message);
+        await handleLegacyEdit(sock, message);
         return;
     }
 
