@@ -267,7 +267,7 @@ async function handleViewOnce(sock, message, type) {
     }
 }
 
-function handleEditedMessage(sock, message) {
+async function handleEditedMessage(sock, message) {
     const proto = message.message?.protocolMessage;
     if (!proto?.editedMessage) return false;
 
@@ -279,7 +279,7 @@ function handleEditedMessage(sock, message) {
 
     if (newText) {
         const originalContent = originalMsg ? extractTextContent(originalMsg.message) : null;
-        processSingleEditedMessage(sock, message, originalContent, newText);
+        await processSingleEditedMessage(sock, message, originalContent, newText);
 
         if (originalMsg) {
             if (!originalMsg.message) originalMsg.message = {};
@@ -297,7 +297,7 @@ async function processMessage(sock, message) {
     const type = getContentType(message.message);
 
     if (type === 'protocolMessage') {
-        handleEditedMessage(sock, message);
+        await handleEditedMessage(sock, message);
         return;
     }
 
@@ -378,9 +378,20 @@ async function startBot() {
                         await processSingleDeletedMessage(sock, deletedMsg);
                         messageStore.delete(key.id);
                     }
+                } else if (update.message) {
+                    const originalMsg = messageStore.get(key.id);
+                    const newText = extractTextContent(update.message);
+                    if (newText && originalMsg) {
+                        const originalContent = extractTextContent(originalMsg.message);
+                        if (originalContent && originalContent !== newText) {
+                            await processSingleEditedMessage(sock, originalMsg, originalContent, newText);
+                            originalMsg.message.conversation = newText;
+                            messageStore.set(key.id, originalMsg);
+                        }
+                    }
                 }
             } catch (e) {
-                console.error(`Error processing deleted message: ${e.message}`);
+                console.error(`Error processing message update: ${e.message}`);
             }
         }
     });
