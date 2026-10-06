@@ -4,7 +4,6 @@ const {
     default: makeWASocket,
     useMultiFileAuthState,
     DisconnectReason,
-    fetchLatestBaileysVersion,
     downloadMediaMessage,
     getContentType
 } = BaileysPkg;
@@ -306,13 +305,9 @@ async function processMessage(sock, message) {
 }
 
 async function startBot() {
-    const { version, isLatest } = await fetchLatestBaileysVersion();
-    console.log(`Using Baileys v${version.join('.')}, isLatest: ${isLatest}`);
-
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
 
     const sock = makeWASocket({
-        version,
         logger,
         auth: state,
         printQRInTerminal: false,
