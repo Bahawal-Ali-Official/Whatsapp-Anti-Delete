@@ -11,7 +11,6 @@ import pino from 'pino';
 import qrTerminal from 'qrcode-terminal';
 
 const logger = pino({ level: 'silent' });
-
 const msgRetryCounterCache = new Map();
 
 const originalConsoleError = console.error;
@@ -49,41 +48,37 @@ class MessageStore {
             const oldestKey = this.store.keys().next().value;
             this.store.delete(oldestKey);
         }
-        const text = extractTextContent(message.message);
         this.store.set(id, {
-            originalMessage: message,
-            messageData: JSON.parse(JSON.stringify(message.message || {})),
-            text: text,
+            message: message,
             timestamp: Date.now()
         });
     }
 
-    getEntry(id) {
+    get(id) {
         const entry = this.store.get(id);
         if (!entry) return null;
         if (Date.now() - entry.timestamp > this.ttlMs) {
             this.store.delete(id);
             return null;
         }
-        return entry;
-    }
-
-    updateEntry(id, newText, newMessageData) {
-        const entry = this.getEntry(id);
-        if (entry) {
-            entry.text = newText;
-            if (newMessageData) {
-                entry.messageData = JSON.parse(JSON.stringify(newMessageData));
-            }
-        }
+        return entry.message;
     }
 
     has(id) {
-        return this.getEntry(id) !== null;
+        return this.get(id) !== null;
     }
 
     delete(id) {
         this.store.delete(id);
+    }
+
+    updateText(id, newText) {
+        const msg = this.get(id);
+        if (msg?.message?.conversation !== undefined) {
+            msg.message.conversation = newText;
+        } else if (msg?.message?.extendedTextMessage?.text !== undefined) {
+            msg.message.extendedTextMessage.text = newText;
+        }
     }
 
     cleanup() {
@@ -97,7 +92,6 @@ class MessageStore {
 }
 
 const messageStore = new MessageStore(MAX_STORE_SIZE, MESSAGE_TTL_MS);
-
 setInterval(() => messageStore.cleanup(), 15 * 60 * 1000);
 
 function sleep(ms) {
@@ -144,7 +138,7 @@ async function getGroupName(sock, jid) {
     }
 }
 
-async function processSingleDeletedMessage(sock, deletedMsg) {
+async function handleDeleted(sock, deletedMsg) {
     try {
         const remoteJid = deletedMsg.key.remoteJid;
         const isGroup = remoteJid.endsWith('@g.us');
@@ -169,17 +163,17 @@ async function processSingleDeletedMessage(sock, deletedMsg) {
             if (mediaMsg) await sock.sendMessage(OWNER_JID, mediaMsg);
         }
     } catch (e) {
-        console.error(`Error in processSingleDeletedMessage: ${e.message}`);
+        console.error(`Error in handleDeleted: ${e.message}`);
     }
 }
 
-async function processSingleEditedMessage(sock, editEventMessage, originalContent, newText) {
+async function handleEdited(sock, eventMsg, origContent, newText) {
     try {
-        const remoteJid = editEventMessage.key.remoteJid;
+        const remoteJid = eventMsg.key.remoteJid;
         const isGroup = remoteJid.endsWith('@g.us');
-        const senderName = editEventMessage.pushName || 'Unknown User';
+        const senderName = eventMsg.pushName || 'Unknown User';
         const location = isGroup ? await getGroupName(sock, remoteJid) : 'Personal Chat';
-        const originalDisplay = originalContent || "_(Original message not found in bot's memory)_";
+        const originalDisplay = origContent || "_(Original message not found in cache)_";
         const timeStr = new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' });
 
         const notification =
@@ -192,7 +186,7 @@ async function processSingleEditedMessage(sock, editEventMessage, originalConten
 
         await sock.sendMessage(OWNER_JID, { text: notification });
     } catch (e) {
-        console.error(`Error in processSingleEditedMessage: ${e.message}`);
+        console.error(`Error in handleEdited: ${e.message}`);
     }
 }
 
@@ -283,46 +277,34 @@ async function handleViewOnce(sock, message, type) {
     }
 }
 
-async function handleProtocolMessageEdit(sock, message) {
-    const proto = message.message?.protocolMessage;
-    if (!proto?.editedMessage) return false;
+async function processMessage(sock, msg) {
+    if (!msg.message || msg.key.fromMe) return;
 
-    const originalMsgId = proto.key?.id;
-    if (!originalMsgId) return false;
+    const type = getContentType(msg.message);
 
-    const entry = messageStore.getEntry(originalMsgId);
-    if (!entry) return false;
-
-    const newText = extractTextContent(proto.editedMessage) || proto.editedMessage?.conversation;
-    const originalText = entry.text;
-
-    if (newText && originalText && originalText !== newText) {
-        await processSingleEditedMessage(sock, message, originalText, newText);
-        messageStore.updateEntry(originalMsgId, newText, proto.editedMessage);
-    }
-
-    return true;
-}
-
-async function processMessage(sock, message) {
-    if (!message.message || message.key.fromMe) return;
-
-    const type = getContentType(message.message);
-
-    if (type === 'protocolMessage') {
-        await handleProtocolMessageEdit(sock, message);
+    const proto = msg.message.protocolMessage;
+    if (proto?.editedMessage) {
+        const origId = proto.key.id;
+        const origMsg = messageStore.get(origId);
+        const newText = proto.editedMessage.conversation || extractTextContent(proto.editedMessage);
+        
+        if (newText) {
+            const origText = extractTextContent(origMsg?.message);
+            await handleEdited(sock, msg, origText, newText);
+            messageStore.updateText(origId, newText);
+        }
         return;
     }
 
-    if (await handleDotCommand(sock, message)) return;
+    if (await handleDotCommand(sock, msg)) return;
 
     if (type === 'viewOnceMessage' || type === 'viewOnceMessageV2' || type === 'viewOnceMessageV2Extension') {
-        await handleViewOnce(sock, message, type);
+        await handleViewOnce(sock, msg, type);
     }
 
-    const id = message.key.id;
+    const id = msg.key.id;
     if (!messageStore.has(id)) {
-        messageStore.set(id, message);
+        messageStore.set(id, msg);
     }
 }
 
@@ -339,8 +321,8 @@ async function startBot() {
         msgRetryCounterCache,
         shouldIgnoreJid: jid => typeof jid === 'string' && jid.includes('@broadcast'),
         getMessage: async (key) => {
-            const entry = messageStore.getEntry(key.id);
-            if (entry) return entry.messageData;
+            const stored = messageStore.get(key.id);
+            if (stored) return stored.message;
             return undefined;
         }
     });
@@ -373,40 +355,35 @@ async function startBot() {
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('messages.upsert', async (m) => {
-        for (const message of m.messages) {
+        if (m.type !== 'notify') return;
+        
+        const tasks = m.messages.map(async (msg) => {
             try {
-                await processMessage(sock, message);
+                await processMessage(sock, msg);
             } catch (e) {
                 console.error(`Error processing message: ${e.message}`);
             }
-        }
+        });
+        
+        await Promise.allSettled(tasks);
     });
 
     sock.ev.on('messages.update', async (updates) => {
-        for (const { key, update } of updates) {
-            try {
-                if (update.message === null) {
-                    const entry = messageStore.getEntry(key.id);
-                    if (entry && entry.originalMessage) {
-                        await processSingleDeletedMessage(sock, entry.originalMessage);
+        const tasks = updates
+            .filter(({ update }) => update.message === null)
+            .map(async ({ key }) => {
+                try {
+                    const deletedMsg = messageStore.get(key.id);
+                    if (deletedMsg) {
                         messageStore.delete(key.id);
+                        await handleDeleted(sock, deletedMsg);
                     }
-                } else if (update.message) {
-                    const entry = messageStore.getEntry(key.id);
-                    if (!entry) continue;
-
-                    const newText = extractTextContent(update.message);
-                    const originalText = entry.text;
-
-                    if (newText && originalText && originalText !== newText) {
-                        await processSingleEditedMessage(sock, entry.originalMessage, originalText, newText);
-                        messageStore.updateEntry(key.id, newText, update.message);
-                    }
+                } catch (e) {
+                    console.error(`Error processing deleted message: ${e.message}`);
                 }
-            } catch (e) {
-                console.error(`Error processing message update: ${e.message}`);
-            }
-        }
+            });
+
+        await Promise.allSettled(tasks);
     });
 
     return sock;
