@@ -1,12 +1,11 @@
 import { Boom } from '@hapi/boom';
-import BaileysPkg from '@whiskeysockets/baileys';
-const {
-    default: makeWASocket,
+import {
+    default as makeWASocket,
     useMultiFileAuthState,
     DisconnectReason,
     downloadMediaMessage,
     getContentType
-} = BaileysPkg;
+} from '@whiskeysockets/baileys';
 import pino from 'pino';
 import qrTerminal from 'qrcode-terminal';
 
