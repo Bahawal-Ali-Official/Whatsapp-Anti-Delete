@@ -369,19 +369,30 @@ async function startBot() {
     });
 
     sock.ev.on('messages.update', async (updates) => {
-        const tasks = updates
-            .filter(({ update }) => update.message === null)
-            .map(async ({ key }) => {
-                try {
+        const tasks = updates.map(async ({ key, update }) => {
+            try {
+                if (update.message === null) {
                     const deletedMsg = messageStore.get(key.id);
                     if (deletedMsg) {
                         messageStore.delete(key.id);
                         await handleDeleted(sock, deletedMsg);
                     }
-                } catch (e) {
-                    console.error(`Error processing deleted message: ${e.message}`);
+                } else if (update.message) {
+                    const originalMsg = messageStore.get(key.id);
+                    if (originalMsg) {
+                        const originalText = extractTextContent(originalMsg.message);
+                        const newText = extractTextContent(update.message);
+                        
+                        if (newText && originalText && originalText !== newText) {
+                            await handleEdited(sock, originalMsg, originalText, newText);
+                            messageStore.updateText(key.id, newText);
+                        }
+                    }
                 }
-            });
+            } catch (e) {
+                console.error(`Error processing message update: ${e.message}`);
+            }
+        });
 
         await Promise.allSettled(tasks);
     });
