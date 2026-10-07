@@ -5,13 +5,19 @@ import {
     DisconnectReason,
     downloadMediaMessage,
     getContentType,
-    makeCacheableSignalKeyStore
+    makeCacheableSignalKeyStore,
+    proto as WAProto,
+    aesDecryptGCM,
+    hmacSign
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import qrTerminal from 'qrcode-terminal';
 
 const logger = pino({ level: 'silent' });
+
 const msgRetryCounterCache = new Map();
+
+const SECRET_ENC_TYPE = WAProto.Message.SecretEncryptedMessage.SecretEncType;
 
 const originalConsoleError = console.error;
 console.error = (...args) => {
@@ -26,16 +32,6 @@ const MEDIA_RETRY_ATTEMPTS = 3;
 const MEDIA_RETRY_DELAY_MS = 2000;
 const OWNER_JID = '923294675295@s.whatsapp.net';
 
-function extractTextContent(message) {
-    if (!message) return null;
-    return message.conversation
-        || message.extendedTextMessage?.text
-        || message.buttonsResponseMessage?.selectedDisplayText
-        || message.listResponseMessage?.title
-        || message.templateButtonReplyMessage?.selectedDisplayText
-        || null;
-}
-
 class MessageStore {
     constructor(maxSize, ttlMs) {
         this.store = new Map();
@@ -48,10 +44,7 @@ class MessageStore {
             const oldestKey = this.store.keys().next().value;
             this.store.delete(oldestKey);
         }
-        this.store.set(id, {
-            message: message,
-            timestamp: Date.now()
-        });
+        this.store.set(id, { message, timestamp: Date.now() });
     }
 
     get(id) {
@@ -72,15 +65,6 @@ class MessageStore {
         this.store.delete(id);
     }
 
-    updateText(id, newText) {
-        const msg = this.get(id);
-        if (msg?.message?.conversation !== undefined) {
-            msg.message.conversation = newText;
-        } else if (msg?.message?.extendedTextMessage?.text !== undefined) {
-            msg.message.extendedTextMessage.text = newText;
-        }
-    }
-
     cleanup() {
         const now = Date.now();
         for (const [id, entry] of this.store) {
@@ -92,6 +76,7 @@ class MessageStore {
 }
 
 const messageStore = new MessageStore(MAX_STORE_SIZE, MESSAGE_TTL_MS);
+
 setInterval(() => messageStore.cleanup(), 15 * 60 * 1000);
 
 function sleep(ms) {
@@ -108,6 +93,16 @@ async function downloadMediaWithRetry(msg, attempts) {
         }
     }
     return null;
+}
+
+function extractTextContent(message) {
+    if (!message) return null;
+    return message.conversation
+        || message.extendedTextMessage?.text
+        || message.buttonsResponseMessage?.selectedDisplayText
+        || message.listResponseMessage?.title
+        || message.templateButtonReplyMessage?.selectedDisplayText
+        || null;
 }
 
 function buildMediaMessage(msgContent, buffer) {
@@ -138,7 +133,23 @@ async function getGroupName(sock, jid) {
     }
 }
 
-async function handleDeleted(sock, deletedMsg) {
+function decryptSecretMessage(encPayload, encIv, secret, targetId, senderJid) {
+    const toBuf = (txt) => Buffer.from(txt);
+    const senderBuf = toBuf(senderJid);
+    const sign = Buffer.concat([
+        toBuf(targetId),
+        senderBuf,
+        senderBuf,
+        toBuf('Message Edit'),
+        new Uint8Array([1])
+    ]);
+    const key = hmacSign(secret, new Uint8Array(32));
+    const decKey = hmacSign(sign, key);
+    const decrypted = aesDecryptGCM(encPayload, decKey, encIv, Buffer.alloc(0));
+    return WAProto.Message.decode(decrypted);
+}
+
+async function processSingleDeletedMessage(sock, deletedMsg) {
     try {
         const remoteJid = deletedMsg.key.remoteJid;
         const isGroup = remoteJid.endsWith('@g.us');
@@ -163,17 +174,17 @@ async function handleDeleted(sock, deletedMsg) {
             if (mediaMsg) await sock.sendMessage(OWNER_JID, mediaMsg);
         }
     } catch (e) {
-        console.error(`Error in handleDeleted: ${e.message}`);
+        console.error(`Failed to process deleted message: ${e.message}`);
     }
 }
 
-async function handleEdited(sock, eventMsg, origContent, newText) {
+async function processSingleEditedMessage(sock, editEventMessage, originalContent, newText) {
     try {
-        const remoteJid = eventMsg.key.remoteJid;
+        const remoteJid = editEventMessage.key.remoteJid;
         const isGroup = remoteJid.endsWith('@g.us');
-        const senderName = eventMsg.pushName || 'Unknown User';
+        const senderName = editEventMessage.pushName || 'Unknown User';
         const location = isGroup ? await getGroupName(sock, remoteJid) : 'Personal Chat';
-        const originalDisplay = origContent || "_(Original message not found in cache)_";
+        const originalDisplay = originalContent || "_(Original message not found in bot's memory)_";
         const timeStr = new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' });
 
         const notification =
@@ -186,7 +197,7 @@ async function handleEdited(sock, eventMsg, origContent, newText) {
 
         await sock.sendMessage(OWNER_JID, { text: notification });
     } catch (e) {
-        console.error(`Error in handleEdited: ${e.message}`);
+        console.error(`Failed to process edited message: ${e.message}`);
     }
 }
 
@@ -277,36 +288,85 @@ async function handleViewOnce(sock, message, type) {
     }
 }
 
-async function processMessage(sock, msg) {
-    if (!msg.message || msg.key.fromMe) return;
+async function handleSecretEncryptedEdit(sock, message) {
+    const secEnc = message.message?.secretEncryptedMessage;
+    if (!secEnc || secEnc.secretEncType !== SECRET_ENC_TYPE.MESSAGE_EDIT) return false;
 
-    const type = getContentType(msg.message);
+    try {
+        const targetId = secEnc.targetMessageKey?.id;
+        if (!targetId) return false;
 
-    if (type === 'editedMessage') {
-        const editProto = msg.message.editedMessage?.message?.protocolMessage;
-        if (!editProto) return;
+        const originalMsg = messageStore.get(targetId);
+        if (!originalMsg) return false;
 
-        const origId = editProto.key?.id;
-        const newText = editProto.editedMessage?.conversation || editProto.editedMessage?.extendedTextMessage?.text;
+        const msgSecret = originalMsg.message?.messageContextInfo?.messageSecret;
+        if (!msgSecret) return false;
 
-        if (origId && newText) {
-            const origMsg = messageStore.get(origId);
-            const origText = extractTextContent(origMsg?.message);
-            await handleEdited(sock, msg, origText, newText);
-            messageStore.updateText(origId, newText);
+        const senderJid = message.key.participant || message.key.remoteJid;
+        const decryptedMsg = decryptSecretMessage(secEnc.encPayload, secEnc.encIv, msgSecret, targetId, senderJid);
+        const newText = extractTextContent(decryptedMsg);
+        if (!newText) return false;
+
+        const originalContent = extractTextContent(originalMsg.message);
+        await processSingleEditedMessage(sock, message, originalContent, newText);
+
+        originalMsg.message.conversation = newText;
+        messageStore.set(targetId, originalMsg);
+        return true;
+    } catch (e) {
+        console.error(`Error decrypting edited message: ${e.message}`);
+        return false;
+    }
+}
+
+async function handleLegacyEdit(sock, message) {
+    const proto = message.message?.protocolMessage;
+    if (!proto?.editedMessage) return false;
+
+    const originalMsgId = proto.key?.id;
+    if (!originalMsgId) return false;
+
+    const originalMsg = messageStore.get(originalMsgId);
+    const newText = extractTextContent(proto.editedMessage) || proto.editedMessage?.conversation;
+
+    if (newText) {
+        const originalContent = originalMsg ? extractTextContent(originalMsg.message) : null;
+        await processSingleEditedMessage(sock, message, originalContent, newText);
+
+        if (originalMsg) {
+            if (!originalMsg.message) originalMsg.message = {};
+            originalMsg.message.conversation = newText;
+            messageStore.set(originalMsgId, originalMsg);
         }
+    }
+
+    return true;
+}
+
+async function processMessage(sock, message) {
+    if (!message.message || message.key.fromMe) return;
+
+    const type = getContentType(message.message);
+
+    if (type === 'secretEncryptedMessage') {
+        await handleSecretEncryptedEdit(sock, message);
         return;
     }
 
-    if (await handleDotCommand(sock, msg)) return;
-
-    if (type === 'viewOnceMessage' || type === 'viewOnceMessageV2' || type === 'viewOnceMessageV2Extension') {
-        await handleViewOnce(sock, msg, type);
+    if (type === 'protocolMessage') {
+        await handleLegacyEdit(sock, message);
+        return;
     }
 
-    const id = msg.key.id;
+    if (await handleDotCommand(sock, message)) return;
+
+    if (type === 'viewOnceMessage' || type === 'viewOnceMessageV2' || type === 'viewOnceMessageV2Extension') {
+        await handleViewOnce(sock, message, type);
+    }
+
+    const id = message.key.id;
     if (!messageStore.has(id)) {
-        messageStore.set(id, msg);
+        messageStore.set(id, message);
     }
 }
 
@@ -357,46 +417,40 @@ async function startBot() {
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('messages.upsert', async (m) => {
-        if (m.type !== 'notify') return;
-        
-        const tasks = m.messages.map(async (msg) => {
+        for (const message of m.messages) {
             try {
-                await processMessage(sock, msg);
+                await processMessage(sock, message);
             } catch (e) {
                 console.error(`Error processing message: ${e.message}`);
             }
-        });
-        
-        await Promise.allSettled(tasks);
+        }
     });
 
     sock.ev.on('messages.update', async (updates) => {
-        const tasks = updates.map(async ({ key, update }) => {
+        for (const { key, update } of updates) {
             try {
                 if (update.message === null) {
                     const deletedMsg = messageStore.get(key.id);
                     if (deletedMsg) {
+                        await processSingleDeletedMessage(sock, deletedMsg);
                         messageStore.delete(key.id);
-                        await handleDeleted(sock, deletedMsg);
                     }
                 } else if (update.message) {
                     const originalMsg = messageStore.get(key.id);
-                    if (originalMsg) {
-                        const originalText = extractTextContent(originalMsg.message);
-                        const newText = extractTextContent(update.message);
-                        
-                        if (newText && originalText && originalText !== newText) {
-                            await handleEdited(sock, originalMsg, originalText, newText);
-                            messageStore.updateText(key.id, newText);
+                    const newText = extractTextContent(update.message);
+                    if (newText && originalMsg) {
+                        const originalContent = extractTextContent(originalMsg.message);
+                        if (originalContent && originalContent !== newText) {
+                            await processSingleEditedMessage(sock, originalMsg, originalContent, newText);
+                            originalMsg.message.conversation = newText;
+                            messageStore.set(key.id, originalMsg);
                         }
                     }
                 }
             } catch (e) {
                 console.error(`Error processing message update: ${e.message}`);
             }
-        });
-
-        await Promise.allSettled(tasks);
+        }
     });
 
     return sock;
