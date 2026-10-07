@@ -55,6 +55,7 @@ class MessageStore {
             text: text,
             timestamp: Date.now()
         });
+        console.log(`[DEBUG] Cached message ID: ${id}`);
     }
 
     getEntry(id) {
@@ -74,6 +75,7 @@ class MessageStore {
             if (newMessageData) {
                 entry.messageData = JSON.parse(JSON.stringify(newMessageData));
             }
+            console.log(`[DEBUG] Updated cache for ID: ${id}`);
         }
     }
 
@@ -83,15 +85,19 @@ class MessageStore {
 
     delete(id) {
         this.store.delete(id);
+        console.log(`[DEBUG] Deleted from cache ID: ${id}`);
     }
 
     cleanup() {
         const now = Date.now();
+        let count = 0;
         for (const [id, entry] of this.store) {
             if (now - entry.timestamp > this.ttlMs) {
                 this.store.delete(id);
+                count++;
             }
         }
+        if (count > 0) console.log(`[DEBUG] Cleaned up ${count} expired messages from cache`);
     }
 }
 
@@ -108,6 +114,7 @@ async function downloadMediaWithRetry(msg, attempts) {
             const buffer = await downloadMediaMessage(msg, 'buffer', {});
             if (buffer && buffer.length > 0) return buffer;
         } catch (e) {
+            console.log(`[DEBUG] Media download attempt ${i + 1} failed: ${e.message}`);
             if (i < attempts - 1) await sleep(MEDIA_RETRY_DELAY_MS);
         }
     }
@@ -143,6 +150,7 @@ async function getGroupName(sock, jid) {
 }
 
 async function handleDeleted(sock, deletedMsg) {
+    console.log(`[DEBUG] Executing handleDeleted for ID: ${deletedMsg.key.id}`);
     try {
         const remoteJid = deletedMsg.key.remoteJid;
         const isGroup = remoteJid.endsWith('@g.us');
@@ -167,11 +175,12 @@ async function handleDeleted(sock, deletedMsg) {
             if (mediaMsg) await sock.sendMessage(OWNER_JID, mediaMsg);
         }
     } catch (e) {
-        console.error(`Error in handleDeleted: ${e.message}`);
+        console.error(`[ERROR] in handleDeleted: ${e.message}`);
     }
 }
 
 async function handleEdited(sock, eventMsg, origContent, newText) {
+    console.log(`[DEBUG] Executing handleEdited for ID: ${eventMsg.key.id}`);
     try {
         const remoteJid = eventMsg.key.remoteJid;
         const isGroup = remoteJid.endsWith('@g.us');
@@ -190,7 +199,7 @@ async function handleEdited(sock, eventMsg, origContent, newText) {
 
         await sock.sendMessage(OWNER_JID, { text: notification });
     } catch (e) {
-        console.error(`Error in handleEdited: ${e.message}`);
+        console.error(`[ERROR] in handleEdited: ${e.message}`);
     }
 }
 
@@ -201,6 +210,7 @@ async function handleDotCommand(sock, message) {
     const textContent = message.message.extendedTextMessage?.text;
     if (textContent !== '.') return false;
 
+    console.log(`[DEBUG] Executing dot command`);
     try {
         const quotedMsg = quotedCtx.quotedMessage;
         const stanzaId = quotedCtx.stanzaId;
@@ -246,13 +256,14 @@ async function handleDotCommand(sock, message) {
 
         if (finalMsg) await sock.sendMessage(OWNER_JID, finalMsg);
     } catch (e) {
-        console.error(`Error in dot command: ${e.message}`);
+        console.error(`[ERROR] in dot command: ${e.message}`);
     }
 
     return true;
 }
 
 async function handleViewOnce(sock, message, type) {
+    console.log(`[DEBUG] Executing ViewOnce detector for ID: ${message.key.id}`);
     try {
         const senderName = message.pushName || 'Unknown User';
         const remoteJid = message.key.remoteJid;
@@ -277,7 +288,7 @@ async function handleViewOnce(sock, message, type) {
             await sock.sendMessage(OWNER_JID, { text: caption });
         }
     } catch (e) {
-        console.error(`Error handling ViewOnce: ${e.message}`);
+        console.error(`[ERROR] handling ViewOnce: ${e.message}`);
     }
 }
 
@@ -285,6 +296,43 @@ async function processMessage(sock, msg) {
     if (!msg.message || msg.key.fromMe) return;
 
     const type = getContentType(msg.message);
+    console.log(`[DEBUG] New message upsert received | ID: ${msg.key.id} | Type: ${type}`);
+
+    const proto = msg.message.protocolMessage;
+    if (proto) {
+        console.log(`[DEBUG] ProtocolMessage detected | Inner Type: ${proto.type}`);
+        
+        if (proto.type === 0 || proto.type === 'REVOKE') {
+            const deletedId = proto.key?.id;
+            console.log(`[DEBUG] REVOKE detected for ID: ${deletedId}`);
+            if (deletedId) {
+                const entry = messageStore.getEntry(deletedId);
+                if (entry && entry.originalMessage) {
+                    messageStore.delete(deletedId);
+                    await handleDeleted(sock, entry.originalMessage);
+                } else {
+                    console.log(`[DEBUG] REVOKE failed: Original message not found in cache for ID: ${deletedId}`);
+                }
+            }
+            return;
+        }
+
+        if (proto.editedMessage) {
+            const origId = proto.key?.id;
+            if (!origId) return;
+
+            const origEntry = messageStore.getEntry(origId);
+            const newText = proto.editedMessage.conversation || extractTextContent(proto.editedMessage);
+            
+            if (newText) {
+                const origText = origEntry ? origEntry.text : null;
+                console.log(`[DEBUG] Edit detected via ProtocolMessage for ID: ${origId}`);
+                await handleEdited(sock, msg, origText, newText);
+                messageStore.updateText(origId, newText, proto.editedMessage);
+            }
+            return;
+        }
+    }
 
     if (type === 'editedMessage') {
         const editProto = msg.message.editedMessage?.message?.protocolMessage;
@@ -296,24 +344,9 @@ async function processMessage(sock, msg) {
         if (origId && newText) {
             const origEntry = messageStore.getEntry(origId);
             const origText = origEntry ? origEntry.text : null;
+            console.log(`[DEBUG] Edit detected via top-level editedMessage for ID: ${origId}`);
             await handleEdited(sock, msg, origText, newText);
             messageStore.updateText(origId, newText, editProto.editedMessage);
-        }
-        return;
-    }
-
-    const proto = msg.message.protocolMessage;
-    if (proto?.editedMessage) {
-        const origId = proto.key?.id;
-        if (!origId) return;
-
-        const origEntry = messageStore.getEntry(origId);
-        const newText = proto.editedMessage.conversation || extractTextContent(proto.editedMessage);
-        
-        if (newText) {
-            const origText = origEntry ? origEntry.text : null;
-            await handleEdited(sock, msg, origText, newText);
-            messageStore.updateText(origId, newText, proto.editedMessage);
         }
         return;
     }
@@ -375,8 +408,10 @@ async function startBot() {
                 ? lastDisconnect.error.output?.statusCode
                 : null;
 
+            console.log(`[DEBUG] Connection closed. StatusCode: ${statusCode}`);
+
             if (statusCode !== DisconnectReason.loggedOut) {
-                console.log(`Connection closed. Reconnecting in ${reconnectDelay / 1000}s...`);
+                console.log(`Reconnecting in ${reconnectDelay / 1000}s...`);
                 setTimeout(() => startBot(), reconnectDelay);
                 reconnectDelay = Math.min(reconnectDelay * 2, 30000);
             } else {
@@ -395,7 +430,7 @@ async function startBot() {
             try {
                 await processMessage(sock, msg);
             } catch (e) {
-                console.error(`Error processing message: ${e.message}`);
+                console.error(`[ERROR] processing message in upsert: ${e.message}`);
             }
         });
         
@@ -406,25 +441,30 @@ async function startBot() {
         const tasks = updates.map(async ({ key, update }) => {
             try {
                 if (update.message === null) {
+                    console.log(`[DEBUG] messages.update received null message (deletion) for ID: ${key.id}`);
                     const entry = messageStore.getEntry(key.id);
                     if (entry && entry.originalMessage) {
                         messageStore.delete(key.id);
                         await handleDeleted(sock, entry.originalMessage);
+                    } else {
+                        console.log(`[DEBUG] Deletion missed: Message ID ${key.id} not in cache`);
                     }
                 } else if (update.message) {
+                    console.log(`[DEBUG] messages.update received modified message for ID: ${key.id}`);
                     const entry = messageStore.getEntry(key.id);
                     if (entry) {
                         const originalText = entry.text;
                         const newText = extractTextContent(update.message);
                         
                         if (newText && originalText && originalText !== newText) {
+                            console.log(`[DEBUG] Edit detected via messages.update for ID: ${key.id}`);
                             await handleEdited(sock, entry.originalMessage, originalText, newText);
                             messageStore.updateText(key.id, newText, update.message);
                         }
                     }
                 }
             } catch (e) {
-                console.error(`Error processing message update: ${e.message}`);
+                console.error(`[ERROR] processing message update: ${e.message}`);
             }
         });
 
@@ -434,10 +474,10 @@ async function startBot() {
     return sock;
 }
 
-process.on('unhandledRejection', err => console.error('Unhandled rejection:', err));
-process.on('uncaughtException', err => console.error('Uncaught exception:', err));
+process.on('unhandledRejection', err => console.error('[ERROR] Unhandled rejection:', err));
+process.on('uncaughtException', err => console.error('[ERROR] Uncaught exception:', err));
 
 startBot().catch(err => {
-    console.error(`Fatal error: ${err.message}`);
+    console.error(`[FATAL ERROR] ${err.message}`);
     process.exit(1);
 });
