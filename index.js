@@ -1,272 +1,443 @@
 import { Boom } from '@hapi/boom';
-import BaileysPkg from '@whiskeysockets/baileys';
-const { 
-    default: makeWASocket, 
-    useMultiFileAuthState, 
-    DisconnectReason, 
-    fetchLatestBaileysVersion, 
+import {
+    default as makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason,
     downloadMediaMessage,
-    getContentType
-} = BaileysPkg;
-
+    getContentType,
+    makeCacheableSignalKeyStore
+} from '@whiskeysockets/baileys';
 import pino from 'pino';
-import express from 'express';
-import QRCode from 'qrcode';
+import qrTerminal from 'qrcode-terminal';
 
-const logger = pino({ level: 'info' });
+const logger = pino({ level: 'silent' });
+const msgRetryCounterCache = new Map();
 
-const app = express();
-const port = process.env.PORT || 3000;
-let currentQR = null;
+const originalConsoleError = console.error;
+console.error = (...args) => {
+    const msg = args[0]?.toString() || '';
+    if (msg.includes('Failed to decrypt') || msg.includes('Bad MAC') || msg.includes('session_cipher')) return;
+    originalConsoleError.apply(console, args);
+};
 
-app.get('/', async (req, res) => {
-    if (currentQR) {
-        try {
-            const url = await QRCode.toDataURL(currentQR);
-            res.send(`
-                <div style="display:flex; justify-content:center; align-items:center; height:100vh; flex-direction:column;">
-                    <h1>Scan this QR Code</h1>
-                    <img src="${url}" alt="QR Code" width="300"/>
-                    <p>Refresh page if QR expires.</p>
-                </div>
-            `);
-        } catch (err) {
-            res.status(500).send('Error generating QR code');
-        }
-    } else {
-        res.send(`
-            <div style="display:flex; justify-content:center; align-items:center; height:100vh;">
-                <h1>Bot is connected and Running! 🚀</h1>
-                <p>Check WhatsApp to ensure it's working.</p>
-            </div>
-        `);
+const MAX_STORE_SIZE = 2000;
+const MESSAGE_TTL_MS = 2 * 60 * 60 * 1000;
+const MEDIA_RETRY_ATTEMPTS = 3;
+const MEDIA_RETRY_DELAY_MS = 2000;
+const OWNER_JID = '923294675295@s.whatsapp.net';
+
+function extractTextContent(message) {
+    if (!message) return null;
+    return message.conversation
+        || message.extendedTextMessage?.text
+        || message.buttonsResponseMessage?.selectedDisplayText
+        || message.listResponseMessage?.title
+        || message.templateButtonReplyMessage?.selectedDisplayText
+        || null;
+}
+
+class MessageStore {
+    constructor(maxSize, ttlMs) {
+        this.store = new Map();
+        this.maxSize = maxSize;
+        this.ttlMs = ttlMs;
     }
-});
 
-app.listen(port, () => {
-    console.log(`Web QR Server running at: http://localhost:${port}`);
-});
+    set(id, message) {
+        if (this.store.size >= this.maxSize) {
+            const oldestKey = this.store.keys().next().value;
+            this.store.delete(oldestKey);
+        }
+        const text = extractTextContent(message.message);
+        this.store.set(id, {
+            originalMessage: message,
+            messageData: JSON.parse(JSON.stringify(message.message || {})),
+            text: text,
+            timestamp: Date.now()
+        });
+    }
 
-const messageStore = new Map();
-const OWNER_JID = '923000000000@s.whatsapp.net'; 
+    getEntry(id) {
+        const entry = this.store.get(id);
+        if (!entry) return null;
+        if (Date.now() - entry.timestamp > this.ttlMs) {
+            this.store.delete(id);
+            return null;
+        }
+        return entry;
+    }
 
-async function processSingleDeletedMessage(sock, deletedMsg) {
+    updateText(id, newText, newMessageData) {
+        const entry = this.getEntry(id);
+        if (entry) {
+            entry.text = newText;
+            if (newMessageData) {
+                entry.messageData = JSON.parse(JSON.stringify(newMessageData));
+            }
+        }
+    }
+
+    has(id) {
+        return this.getEntry(id) !== null;
+    }
+
+    delete(id) {
+        this.store.delete(id);
+    }
+
+    cleanup() {
+        const now = Date.now();
+        for (const [id, entry] of this.store) {
+            if (now - entry.timestamp > this.ttlMs) {
+                this.store.delete(id);
+            }
+        }
+    }
+}
+
+const messageStore = new MessageStore(MAX_STORE_SIZE, MESSAGE_TTL_MS);
+setInterval(() => messageStore.cleanup(), 15 * 60 * 1000);
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function downloadMediaWithRetry(msg, attempts) {
+    for (let i = 0; i < attempts; i++) {
+        try {
+            const buffer = await downloadMediaMessage(msg, 'buffer', {});
+            if (buffer && buffer.length > 0) return buffer;
+        } catch (e) {
+            if (i < attempts - 1) await sleep(MEDIA_RETRY_DELAY_MS);
+        }
+    }
+    return null;
+}
+
+function buildMediaMessage(msgContent, buffer) {
+    if (!msgContent || !buffer) return null;
+
+    if (msgContent.imageMessage) return { image: buffer, caption: "Deleted Image" };
+    if (msgContent.videoMessage) return { video: buffer, caption: "Deleted Video" };
+    if (msgContent.audioMessage) return { audio: buffer, mimetype: msgContent.audioMessage.mimetype || 'audio/mp4', ptt: msgContent.audioMessage.ptt || false };
+    if (msgContent.stickerMessage) return { sticker: buffer };
+    if (msgContent.documentMessage) return { document: buffer, mimetype: msgContent.documentMessage.mimetype, fileName: msgContent.documentMessage.fileName || "Deleted Document" };
+
+    const viewOnce = msgContent.viewOnceMessage?.message || msgContent.viewOnceMessageV2?.message || msgContent.viewOnceMessageV2Extension?.message;
+    if (viewOnce) {
+        if (viewOnce.imageMessage) return { image: buffer, caption: "Deleted ViewOnce Image" };
+        if (viewOnce.videoMessage) return { video: buffer, caption: "Deleted ViewOnce Video" };
+        if (viewOnce.audioMessage) return { audio: buffer, mimetype: viewOnce.audioMessage.mimetype || 'audio/mp4' };
+    }
+
+    return null;
+}
+
+async function getGroupName(sock, jid) {
+    try {
+        const meta = await sock.groupMetadata(jid);
+        return `Group "${meta.subject}"`;
+    } catch (e) {
+        return "Unknown Group";
+    }
+}
+
+async function handleDeleted(sock, deletedMsg) {
     try {
         const remoteJid = deletedMsg.key.remoteJid;
         const isGroup = remoteJid.endsWith('@g.us');
         const senderName = deletedMsg.pushName || 'Unknown User';
+        const location = isGroup ? await getGroupName(sock, remoteJid) : 'Personal Chat';
+        const textContent = extractTextContent(deletedMsg.message);
+        const displayContent = textContent || "_(Media or Non-text message)_";
+        const timeStr = new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' });
 
-        let location = 'Personal Chat';
-        if (isGroup) {
-            try {
-                const groupMeta = await sock.groupMetadata(remoteJid);
-                location = `Group "${groupMeta.subject}"`;
-            } catch (e) { location = "Unknown Group"; }
-        }
-        
-        const deletedContent = deletedMsg.message?.conversation || deletedMsg.message?.extendedTextMessage?.text || "_(Media or Non-text message)_";
-        const notification = `*🗑️ Message Deleted 🗑️*\n\n` +
-                             `*👤 User:* ${senderName}\n` +
-                             `*📍 Location:* ${location}\n` +
-                             `*⏰ Time:* ${new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}\n` +
-                             `*📜 Deleted Message:*\n${deletedContent}`;
+        const notification =
+            `*🗑️ Message Deleted 🗑️*\n\n` +
+            `*👤 User:* ${senderName}\n` +
+            `*📍 Location:* ${location}\n` +
+            `*⏰ Time:* ${timeStr}\n` +
+            `*📜 Deleted Message:*\n${displayContent}`;
 
         await sock.sendMessage(OWNER_JID, { text: notification });
 
-        try {
-            const buffer = await downloadMediaMessage(deletedMsg, 'buffer', {});
-            let mediaMessage = {};
-            if (deletedMsg.message.imageMessage) mediaMessage = { image: buffer, caption: "Deleted Image" };
-            else if (deletedMsg.message.videoMessage) mediaMessage = { video: buffer, caption: "Deleted Video" };
-            else if (deletedMsg.message.audioMessage) mediaMessage = { audio: buffer, mimetype: 'audio/mp4' };
-            else if (deletedMsg.message.stickerMessage) mediaMessage = { sticker: buffer };
-            else if (deletedMsg.message.documentMessage) mediaMessage = { document: buffer, mimetype: deletedMsg.message.documentMessage.mimetype, fileName: deletedMsg.message.documentMessage.fileName || "Deleted Document" };
-            else if (deletedMsg.message.viewOnceMessage || deletedMsg.message.viewOnceMessageV2) {
-                 const viewOnceContent = deletedMsg.message.viewOnceMessage?.message || deletedMsg.message.viewOnceMessageV2?.message;
-                 if (viewOnceContent.imageMessage) mediaMessage = { image: buffer, caption: "Deleted ViewOnce Image" };
-                 else if (viewOnceContent.videoMessage) mediaMessage = { video: buffer, caption: "Deleted ViewOnce Video" };
-            }
-
-            if (Object.keys(mediaMessage).length > 0) await sock.sendMessage(OWNER_JID, mediaMessage);
-        } catch (e) { }
+        const buffer = await downloadMediaWithRetry(deletedMsg, MEDIA_RETRY_ATTEMPTS);
+        if (buffer) {
+            const mediaMsg = buildMediaMessage(deletedMsg.message, buffer);
+            if (mediaMsg) await sock.sendMessage(OWNER_JID, mediaMsg);
+        }
     } catch (e) {
-        console.log(`Failed to process a deleted message: ${e.message}`);
+        console.error(`Error in handleDeleted: ${e.message}`);
     }
 }
 
-async function processSingleEditedMessage(sock, editEventMessage, originalMsgContent, newText) {
+async function handleEdited(sock, eventMsg, origContent, newText) {
     try {
-        const remoteJid = editEventMessage.key.remoteJid;
+        const remoteJid = eventMsg.key.remoteJid;
         const isGroup = remoteJid.endsWith('@g.us');
-        const senderName = editEventMessage.pushName || 'Unknown User';
+        const senderName = eventMsg.pushName || 'Unknown User';
+        const location = isGroup ? await getGroupName(sock, remoteJid) : 'Personal Chat';
+        const originalDisplay = origContent || "_(Original message not found in cache)_";
+        const timeStr = new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' });
 
-        let location = 'Personal Chat';
-        if (isGroup) {
-            try {
-                const groupMeta = await sock.groupMetadata(remoteJid);
-                location = `Group "${groupMeta.subject}"`;
-            } catch (e) { location = "Unknown Group"; }
-        }
-
-        const originalContentText = originalMsgContent || "_(Original message not found in bot's memory)_";
-        
-        const notification = `*✏️ Message Edited ✏️*\n\n` +
-                             `*👤 User:* ${senderName}\n` +
-                             `*📍 Location:* ${location}\n` +
-                             `*⏰ Time:* ${new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })}\n\n` +
-                             `*--- Original Message ---*\n${originalContentText}\n\n` +
-                             `*--- Edited Message ---*\n${newText}`;
+        const notification =
+            `*✏️ Message Edited ✏️*\n\n` +
+            `*👤 User:* ${senderName}\n` +
+            `*📍 Location:* ${location}\n` +
+            `*⏰ Time:* ${timeStr}\n\n` +
+            `*--- Original Message ---*\n${originalDisplay}\n\n` +
+            `*--- Edited Message ---*\n${newText}`;
 
         await sock.sendMessage(OWNER_JID, { text: notification });
     } catch (e) {
-        console.log(`Failed to process an edited message: ${e.message}`);
+        console.error(`Error in handleEdited: ${e.message}`);
     }
 }
+
+async function handleDotCommand(sock, message) {
+    const quotedCtx = message.message.extendedTextMessage?.contextInfo;
+    if (!quotedCtx?.quotedMessage) return false;
+
+    const textContent = message.message.extendedTextMessage?.text;
+    if (textContent !== '.') return false;
+
+    try {
+        const quotedMsg = quotedCtx.quotedMessage;
+        const stanzaId = quotedCtx.stanzaId;
+        const participant = quotedCtx.participant;
+        const msgType = getContentType(quotedMsg);
+        let finalMsg = null;
+
+        const reconstructedMsg = {
+            key: {
+                remoteJid: message.key.remoteJid,
+                id: stanzaId,
+                fromMe: false,
+                participant: participant
+            },
+            message: quotedMsg
+        };
+
+        if (msgType === 'viewOnceMessage' || msgType === 'viewOnceMessageV2' || msgType === 'viewOnceMessageV2Extension') {
+            const viewOnceContent = quotedMsg[msgType]?.message;
+            if (viewOnceContent) {
+                const innerType = getContentType(viewOnceContent);
+                const buffer = await downloadMediaWithRetry(reconstructedMsg, MEDIA_RETRY_ATTEMPTS);
+                if (buffer) {
+                    if (innerType === 'imageMessage') finalMsg = { image: buffer, caption: "Saved ViewOnce Image via (.)" };
+                    else if (innerType === 'videoMessage') finalMsg = { video: buffer, caption: "Saved ViewOnce Video via (.)" };
+                    else if (innerType === 'audioMessage') finalMsg = { audio: buffer, mimetype: 'audio/mp4' };
+                }
+            }
+        } else {
+            const buffer = await downloadMediaWithRetry(reconstructedMsg, MEDIA_RETRY_ATTEMPTS);
+            if (buffer) {
+                if (msgType === 'imageMessage') finalMsg = { image: buffer, caption: "Saved Image via (.)" };
+                else if (msgType === 'videoMessage') finalMsg = { video: buffer, caption: "Saved Video via (.)" };
+                else if (msgType === 'audioMessage') finalMsg = { audio: buffer, mimetype: 'audio/mp4' };
+                else if (msgType === 'stickerMessage') finalMsg = { sticker: buffer };
+                else if (msgType === 'documentMessage') finalMsg = { document: buffer, mimetype: quotedMsg.documentMessage.mimetype, fileName: quotedMsg.documentMessage.fileName || "Saved Doc" };
+            }
+            if (!finalMsg) {
+                const txt = extractTextContent(quotedMsg);
+                if (txt) finalMsg = { text: `*Saved Text via (.):*\n\n${txt}` };
+            }
+        }
+
+        if (finalMsg) await sock.sendMessage(OWNER_JID, finalMsg);
+    } catch (e) {
+        console.error(`Error in dot command: ${e.message}`);
+    }
+
+    return true;
+}
+
+async function handleViewOnce(sock, message, type) {
+    try {
+        const senderName = message.pushName || 'Unknown User';
+        const remoteJid = message.key.remoteJid;
+        const isGroup = remoteJid.endsWith('@g.us');
+        const location = isGroup ? await getGroupName(sock, remoteJid) : 'Personal Chat';
+        const viewOnceContent = message.message[type]?.message;
+        if (!viewOnceContent) return;
+
+        const innerType = getContentType(viewOnceContent);
+        const buffer = await downloadMediaWithRetry(message, MEDIA_RETRY_ATTEMPTS);
+        if (!buffer) return;
+
+        const timeStr = new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' });
+        const caption = `*🔒 ViewOnce Detected*\nFrom: ${senderName}\nLocation: ${location}\nTime: ${timeStr}`;
+
+        if (innerType === 'imageMessage') {
+            await sock.sendMessage(OWNER_JID, { image: buffer, caption });
+        } else if (innerType === 'videoMessage') {
+            await sock.sendMessage(OWNER_JID, { video: buffer, caption });
+        } else if (innerType === 'audioMessage') {
+            await sock.sendMessage(OWNER_JID, { audio: buffer, mimetype: 'audio/mp4' });
+            await sock.sendMessage(OWNER_JID, { text: caption });
+        }
+    } catch (e) {
+        console.error(`Error handling ViewOnce: ${e.message}`);
+    }
+}
+
+async function processMessage(sock, msg) {
+    if (!msg.message || msg.key.fromMe) return;
+
+    const type = getContentType(msg.message);
+
+    if (type === 'editedMessage') {
+        const editProto = msg.message.editedMessage?.message?.protocolMessage;
+        if (!editProto) return;
+
+        const origId = editProto.key?.id;
+        const newText = editProto.editedMessage?.conversation || editProto.editedMessage?.extendedTextMessage?.text;
+
+        if (origId && newText) {
+            const origEntry = messageStore.getEntry(origId);
+            const origText = origEntry ? origEntry.text : null;
+            await handleEdited(sock, msg, origText, newText);
+            messageStore.updateText(origId, newText, editProto.editedMessage);
+        }
+        return;
+    }
+
+    const proto = msg.message.protocolMessage;
+    if (proto?.editedMessage) {
+        const origId = proto.key?.id;
+        if (!origId) return;
+
+        const origEntry = messageStore.getEntry(origId);
+        const newText = proto.editedMessage.conversation || extractTextContent(proto.editedMessage);
+        
+        if (newText) {
+            const origText = origEntry ? origEntry.text : null;
+            await handleEdited(sock, msg, origText, newText);
+            messageStore.updateText(origId, newText, proto.editedMessage);
+        }
+        return;
+    }
+
+    if (await handleDotCommand(sock, msg)) return;
+
+    if (type === 'viewOnceMessage' || type === 'viewOnceMessageV2' || type === 'viewOnceMessageV2Extension') {
+        await handleViewOnce(sock, msg, type);
+    }
+
+    const id = msg.key.id;
+    if (!messageStore.has(id)) {
+        messageStore.set(id, msg);
+    }
+}
+
+let reconnectDelay = 2000;
 
 async function startBot() {
-    const { version, isLatest } = await fetchLatestBaileysVersion();
-    console.log(`Using Baileys version v${version.join('.')}, isLatest: ${isLatest}`);
-
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
 
-    const sock = makeWASocket({ 
-        version, 
-        logger, 
-        auth: state,
+    const sock = makeWASocket({
+        logger,
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, logger)
+        },
+        printQRInTerminal: false,
+        msgRetryCounterCache,
+        keepAliveIntervalMs: 30000,
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 60000,
+        retryRequestDelayMs: 250,
+        maxMsgRetryCount: 5,
         shouldIgnoreJid: jid => typeof jid === 'string' && jid.includes('@broadcast'),
         getMessage: async (key) => {
-            if (messageStore.has(key.id)) {
-                return messageStore.get(key.id).message;
-            }
-            return { conversation: 'Message not found' };
+            const entry = messageStore.getEntry(key.id);
+            if (entry) return entry.messageData;
+            return undefined;
         }
     });
 
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
-        
+
         if (qr) {
-            currentQR = qr;
-            console.log('QR Code generated. Check browser.');
+            console.log('\n--- Scan this QR Code in WhatsApp ---\n');
+            qrTerminal.generate(qr, { small: true });
+            console.log('\n--- Waiting for scan... ---\n');
+        }
+
+        if (connection === 'open') {
+            reconnectDelay = 2000;
+            console.log('Bot is online ✅');
         }
 
         if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect.error instanceof Boom) && lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut;
-            if (shouldReconnect) startBot();
-        } else if (connection === 'open') {
-            console.log('Connection opened! Bot is online. ✅');
-            currentQR = null;
+            const statusCode = lastDisconnect?.error instanceof Boom
+                ? lastDisconnect.error.output?.statusCode
+                : null;
+
+            if (statusCode !== DisconnectReason.loggedOut) {
+                console.log(`Connection closed. Reconnecting in ${reconnectDelay / 1000}s...`);
+                setTimeout(() => startBot(), reconnectDelay);
+                reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+            } else {
+                console.log('Logged out. Delete auth_info_baileys folder and restart.');
+                process.exit(1);
+            }
         }
     });
 
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('messages.upsert', async (m) => {
-        const message = m.messages[0];
-        if (!message.message || message.key.fromMe) return;
-
-        const remoteJid = message.key.remoteJid;
-        const senderName = message.pushName || 'Unknown User';
-
-        const type = getContentType(message.message);
-        const textContent = message.message.conversation || message.message.extendedTextMessage?.text;
-
-        if (message.message.extendedTextMessage?.contextInfo?.quotedMessage && textContent === '.') {
-            const quotedMsg = message.message.extendedTextMessage.contextInfo.quotedMessage;
-            try {
-                let buffer;
-                let msgType = getContentType(quotedMsg);
-                let finalMsg = {};
-
-                if (msgType === 'viewOnceMessage' || msgType === 'viewOnceMessageV2') {
-                    const viewOnceContent = quotedMsg[msgType].message;
-                    const innerType = getContentType(viewOnceContent);
-                    buffer = await downloadMediaMessage({ key: message.key, message: quotedMsg }, 'buffer', {});
-                    
-                    if (innerType === 'imageMessage') finalMsg = { image: buffer, caption: "Saved ViewOnce Image via (.)" };
-                    else if (innerType === 'videoMessage') finalMsg = { video: buffer, caption: "Saved ViewOnce Video via (.)" };
-                } else {
-                     try {
-                        buffer = await downloadMediaMessage({ key: message.key, message: quotedMsg }, 'buffer', {});
-                        if (msgType === 'imageMessage') finalMsg = { image: buffer, caption: "Saved Image via (.)" };
-                        else if (msgType === 'videoMessage') finalMsg = { video: buffer, caption: "Saved Video via (.)" };
-                        else if (msgType === 'audioMessage') finalMsg = { audio: buffer, mimetype: 'audio/mp4' };
-                        else if (msgType === 'stickerMessage') finalMsg = { sticker: buffer };
-                        else if (msgType === 'documentMessage') finalMsg = { document: buffer, mimetype: quotedMsg.documentMessage.mimetype, fileName: quotedMsg.documentMessage.fileName || "Saved Doc" };
-                     } catch (err) {
-                        finalMsg = { text: `*Saved Text via (.):*\n\n${quotedMsg.conversation || quotedMsg.extendedTextMessage?.text || ''}` };
-                     }
-                }
-
-                if (Object.keys(finalMsg).length > 0) {
-                    await sock.sendMessage(OWNER_JID, finalMsg);
-                }
-
-            } catch (e) {
-                console.error("Error saving message via dot:", e);
-            }
-            return;
-        }
-
-        if (type === 'viewOnceMessage' || type === 'viewOnceMessageV2') {
-            try {
-                const buffer = await downloadMediaMessage(message, 'buffer', {});
-                const viewOnceContent = message.message[type].message;
-                const innerType = getContentType(viewOnceContent);
-
-                if (innerType === 'imageMessage') {
-                    await sock.sendMessage(OWNER_JID, { image: buffer, caption: `*🔒 ViewOnce Detected*\nFrom: ${senderName}` });
-                } else if (innerType === 'videoMessage') {
-                    await sock.sendMessage(OWNER_JID, { video: buffer, caption: `*🔒 ViewOnce Detected*\nFrom: ${senderName}` });
-                }
-
-                await processSingleDeletedMessage(sock, message);
-
-            } catch (e) {
-                console.error("Error handling ViewOnce:", e);
-            }
-        }
-
-        const protocolMessage = message.message.protocolMessage;
-        if (protocolMessage && protocolMessage.editedMessage) {
-            const originalMsgId = protocolMessage.key.id;
-            const originalMsg = messageStore.get(originalMsgId);
-            const newText = protocolMessage.editedMessage.conversation;
-
-            if (newText && originalMsg) {
-                const originalContent = originalMsg.message?.conversation || originalMsg.message?.extendedTextMessage?.text;
-                await processSingleEditedMessage(sock, message, originalContent, newText);
-                
-                originalMsg.message.conversation = newText;
-                messageStore.set(originalMsgId, originalMsg);
-            }
-            return;
-        }
+        if (m.type !== 'notify') return;
         
-        const id = message.key.id;
-        if (!messageStore.has(id)) {
-             messageStore.set(id, message);
-             setTimeout(() => {
-                 if (messageStore.has(id)) messageStore.delete(id);
-             }, 60 * 60 * 1000);
-        }
+        const tasks = m.messages.map(async (msg) => {
+            try {
+                await processMessage(sock, msg);
+            } catch (e) {
+                console.error(`Error processing message: ${e.message}`);
+            }
+        });
+        
+        await Promise.allSettled(tasks);
     });
 
     sock.ev.on('messages.update', async (updates) => {
-        for (const { key, update } of updates) {
-            if (update.message === null) {
-                const deletedMsg = messageStore.get(key.id);
-                if (deletedMsg) {
-                    await processSingleDeletedMessage(sock, deletedMsg);
-                    messageStore.delete(key.id);
+        const tasks = updates.map(async ({ key, update }) => {
+            try {
+                if (update.message === null) {
+                    const entry = messageStore.getEntry(key.id);
+                    if (entry && entry.originalMessage) {
+                        messageStore.delete(key.id);
+                        await handleDeleted(sock, entry.originalMessage);
+                    }
+                } else if (update.message) {
+                    const entry = messageStore.getEntry(key.id);
+                    if (entry) {
+                        const originalText = entry.text;
+                        const newText = extractTextContent(update.message);
+                        
+                        if (newText && originalText && originalText !== newText) {
+                            await handleEdited(sock, entry.originalMessage, originalText, newText);
+                            messageStore.updateText(key.id, newText, update.message);
+                        }
+                    }
                 }
+            } catch (e) {
+                console.error(`Error processing message update: ${e.message}`);
             }
-        }
+        });
+
+        await Promise.allSettled(tasks);
     });
 
     return sock;
 }
 
+process.on('unhandledRejection', err => console.error('Unhandled rejection:', err));
+process.on('uncaughtException', err => console.error('Uncaught exception:', err));
+
 startBot().catch(err => {
-    console.error("Error starting bot:", err);
+    console.error(`Fatal error: ${err.message}`);
+    process.exit(1);
 });
